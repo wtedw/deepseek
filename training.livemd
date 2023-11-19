@@ -1,0 +1,328 @@
+# Training LoRA on Elixirforum Data - optimized - fork
+
+```elixir
+Mix.install([
+  {:bumblebee, "~> 0.4.2"},
+  {:axon, "~> 0.6.0"},
+  {:polaris, git: "https://github.com/wtedw/polaris.git", override: true},
+  {:nx, "~> 0.6.1"},
+  {:exla, "~> 0.6.1"},
+  # {:explorer, "~> 0.7.0"},
+  {:lorax, git: "https://github.com/wtedw/lorax.git"},
+  {:req, "~> 0.4.0"},
+  {:kino, "~> 0.11.0"}
+])
+
+Nx.default_backend(EXLA.Backend)
+```
+
+## Hyperparameters
+
+```elixir
+batch_size = 2
+sequence_length = 512
+r = 4
+lora_alpha = 8
+lora_dropout = 0.05
+
+:ok
+```
+
+## Load a model
+
+```elixir
+repo = {:hf, "deepseek-ai/deepseek-coder-1.3b-base"}
+
+{:ok, model_info} = Bumblebee.load_model(repo)
+
+{:ok, tokenizer} =
+  Bumblebee.load_tokenizer(
+    {:hf, "deepseek-ai/deepseek-coder-1.3b-base",
+     revision: "e94f2b11bc28abbd67ecadfaad058c30b24a589f"}
+  )
+
+{:ok, generation_config} = Bumblebee.load_generation_config(repo)
+
+:ok
+```
+
+## Prepare a dataset
+
+```elixir
+# text = Kino.Input.textarea("Text Data")
+text =
+  Req.get!("https://raw.githubusercontent.com/wtedw/lorax/main/data/elixir-discussion.txt").body
+
+:ok
+```
+
+```elixir
+tokenized_text = %{"input_ids" => input_ids} = Bumblebee.apply_tokenizer(tokenizer, text)
+n_tokens = Nx.size(input_ids)
+n_train = round(n_tokens * 0.9)
+n_val = n_tokens - n_train
+
+train_data =
+  for {input_key, tokenized_values} <- tokenized_text, into: %{} do
+    {input_key, Nx.slice_along_axis(tokenized_values, 0, n_train, axis: -1)}
+  end
+
+test_data =
+  for {input_key, tokenized_values} <- tokenized_text, into: %{} do
+    {input_key, Nx.slice_along_axis(tokenized_values, n_train, n_val, axis: -1)}
+  end
+```
+
+```elixir
+defmodule DataStream do
+  def get_batch_stream(%{"input_ids" => input_ids} = data, batch_size, block_size, opts \\ []) do
+    seed = Keyword.get(opts, :seed, 1337)
+
+    Stream.resource(
+      # initialization function
+      fn ->
+        Nx.Random.key(seed)
+      end,
+      # generation function
+      fn key ->
+        {_b, t} = Nx.shape(input_ids)
+
+        data =
+          for {k, v} <- data, into: %{} do
+            {k, Nx.reshape(v, {t})}
+          end
+
+        # ix = list of random starting indices
+        {ix, new_key} =
+          Nx.Random.randint(key, 0, t - block_size, shape: {batch_size}, type: :u32)
+
+        ix = Nx.to_list(ix)
+
+        # x is map of sliced tensors
+        x =
+          for {k, tensor} <- data, into: %{} do
+            batch_slice =
+              ix
+              |> Enum.map(fn i -> Nx.slice_along_axis(tensor, i, block_size, axis: -1) end)
+              |> Nx.stack()
+
+            {k, batch_slice}
+          end
+
+        # y represents all the predicted next tokens (input_ids shifted by 1) 
+        y =
+          ix
+          |> Enum.map(fn i ->
+            data["input_ids"] |> Nx.slice_along_axis(i + 1, block_size, axis: -1)
+          end)
+          |> Nx.stack()
+          |> Nx.flatten()
+
+        out_data = {x, y}
+
+        {[out_data], new_key}
+      end,
+      fn _ -> :ok end
+    )
+  end
+end
+```
+
+You can see what a single batch looks like by grabbing 1 from the stream:
+
+```elixir
+train_batch_stream = DataStream.get_batch_stream(train_data, batch_size, sequence_length)
+test_batch_stream = DataStream.get_batch_stream(test_data, batch_size, sequence_length)
+
+[{x, y}] = train_batch_stream |> Enum.take(1)
+[{x_val, y_val}] = test_batch_stream |> Enum.take(1)
+
+Bumblebee.Tokenizer.decode(tokenizer, x["input_ids"]) |> IO.inspect()
+IO.puts("=====")
+Bumblebee.Tokenizer.decode(tokenizer, y) |> IO.inspect()
+
+:ok
+```
+
+## Train the model
+
+Now we can go about training the model! First, we need to extract the Axon model and parameters from the Bumblebee model map:
+
+```elixir
+%{model: model, params: params} = model_info
+
+model
+```
+
+The Axon model actually outputs a map with `:logits`, `:hidden_states`, and `:attentions`. You can see this by using `Axon.get_output_shape/2` with an input. This method symbolically executes the graph and gets the resulting shapes:
+
+```elixir
+[{input, _}] = Enum.take(train_batch_stream, 1)
+Axon.get_output_shape(model, input)
+```
+
+For training LoRA adapters, we'll freeze the original layers, and append adapters to our target nodes
+
+```elixir
+lora_model =
+  model
+  |> Axon.freeze()
+  |> Lorax.inject(%Lorax.Config{
+    r: r,
+    alpha: lora_alpha,
+    dropout: lora_dropout,
+    target_key: true,
+    target_query: true,
+    target_value: true
+  })
+```
+
+```elixir
+defmodule CheckpointHelper do
+  def load_last_checkpoint(%Axon.Loop{} = loop, checkpoint_path) do
+    with {:ok, last_checkpoint} <- get_most_recent_checkpoint(checkpoint_path) do
+      last_state =
+        (checkpoint_path <> "/" <> last_checkpoint)
+        |> IO.inspect(label: "Resuming training from this checkpoint")
+        |> File.read!()
+        |> Axon.Loop.deserialize_state()
+
+      Axon.Loop.from_state(loop, last_state)
+    else
+      _ ->
+        IO.puts("Starting training from scratch")
+        loop
+    end
+  end
+
+  defp get_most_recent_checkpoint(dir_path) do
+    {:ok, filenames} = File.ls(dir_path)
+
+    filenames
+    |> Enum.filter(&String.starts_with?(&1, "checkpoint_"))
+    |> Enum.map(fn filename ->
+      [_, checkpoint1, checkpoint2] = Regex.run(~r/checkpoint_(\d+)_(\d+)/, filename)
+      {String.to_integer(checkpoint1), String.to_integer(checkpoint2), filename}
+    end)
+    |> Enum.max_by(fn {checkpoint1, checkpoint2, _} -> {checkpoint1, checkpoint2} end, fn ->
+      nil
+    end)
+    |> case do
+      nil ->
+        {:error, "No checkpoint file found"}
+
+      {_, _, filename} ->
+        {:ok, filename}
+    end
+  end
+end
+
+checkpoint_path = "/Users/ted/Downloads/checkpoints"
+
+checkpoint_file_pattern = fn %Axon.Loop.State{epoch: epoch, iteration: iter} ->
+  "checkpoint_#{epoch}_#{iter}.ckpt"
+end
+```
+
+Now we can declare our training loop. You can construct Axon training loops using the `Axon.Loop.trainer/3` factory method with a model, loss function, and optimizer. We'll also adjust the log-settings to more frequently log metrics to standard out:
+
+```elixir
+defmodule CommonTrain do
+  import Nx.Defn
+
+  defn custom_predict_fn(model_predict_fn, params, input) do
+    %{prediction: preds} = out = model_predict_fn.(params, input)
+
+    # Output of GPT2 model is a map containing logits and other tensors
+    logits = preds.logits
+
+    {b, t, c} = Nx.shape(logits)
+    reshaped = Nx.reshape(logits, {b * t, c})
+    %{out | prediction: reshaped}
+  end
+
+  def custom_loss_fn(y_true, y_pred) do
+    Axon.Losses.categorical_cross_entropy(y_true, y_pred,
+      from_logits: true,
+      sparse: true,
+      reduction: :mean
+    )
+  end
+
+  def custom_optimizer({init_fn, update_fn} = _optimizer, og_keys) do
+    wrapper_init_fn = fn model_state ->
+      model_state = model_state |> Map.drop(og_keys)
+      init_fn.(model_state)
+    end
+
+    wrapper_update_fn = fn gradients, optimizer_state, model_state ->
+      gradients = gradients |> Map.drop(og_keys)
+      {scale, %{mu: mu, nu: nu}} = optimizer_state
+      model_state = model_state |> Map.drop(og_keys)
+      {t1, t2} = update_fn.(gradients, optimizer_state, model_state)
+
+      IO.inspect(mu |> Map.keys())
+      # IO.inspect(t1, label: "t1 keys")
+      IO.puts("####")
+      # IO.inspect(t2, label: "t2 keys")
+
+      {t1, t2}
+    end
+
+    {wrapper_init_fn, wrapper_update_fn}
+  end
+end
+
+og_keys = params |> Map.keys()
+{init_fn, predict_fn} = Axon.build(lora_model, mode: :train)
+custom_predict_fn = &CommonTrain.custom_predict_fn(predict_fn, &1, &2)
+custom_loss_fn = &CommonTrain.custom_loss_fn(&1, &2)
+
+custom_optimizer =
+  CommonTrain.custom_optimizer(Polaris.Optimizers.adam(learning_rate: 3.0e-4), og_keys)
+
+lora_params =
+  {init_fn, custom_predict_fn}
+  |> Axon.Loop.trainer(custom_loss_fn, custom_optimizer)
+  # |> CheckpointHelper.load_last_checkpoint(checkpoint_path)
+  # |> Axon.Loop.checkpoint(
+  #   event: :iteration_completed,
+  #   filter: [every: 99],
+  #   path: "/Users/ted/Downloads/checkpoints"
+  # )
+  |> Axon.Loop.run(train_batch_stream, params, epochs: 1, iterations: 1, compiler: EXLA)
+
+:ok
+```
+
+## Testing out text Generation
+
+```elixir
+# lora_params |> Map.keys()
+Lorax.Params.kino_download(lora_params, params)
+ser = Lorax.Params.serialize_params(lora_params, params |> Map.keys())
+File.write!("/Users/ted/Downloads/params6-9999.lorax", ser)
+```
+
+```elixir
+lora_model_info = %{model: lora_model, params: lora_params, spec: spec}
+
+lora_generation_config =
+  Bumblebee.configure(generation_config,
+    max_new_tokens: 512,
+    strategy: %{type: :multinomial_sampling, top_p: 0.8}
+  )
+
+serving =
+  Bumblebee.Text.generation(lora_model_info, tokenizer, lora_generation_config,
+    compile: [batch_size: 1, sequence_length: 512],
+    stream: true,
+    defn_options: [compiler: EXLA, lazy_transfers: :always]
+  )
+
+Kino.start_child({Nx.Serving, name: Llama, serving: serving})
+```
+
+```elixir
+Nx.Serving.batched_run(Llama, "Title: ") |> Enum.each(&IO.write/1)
+```
